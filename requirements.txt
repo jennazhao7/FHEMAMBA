@@ -1,0 +1,7 @@
+torch>=2.2
+transformers>=4.44
+datasets>=3.0
+accelerate>=0.34
+mamba-ssm>=2.2.2
+einops>=0.8
+tqdm
