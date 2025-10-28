@@ -23,20 +23,39 @@ class MambaBlock(nn.Module):
 class TinyMambaClassifier(nn.Module):
     def __init__(self, vocab_size, d_model=192, n_layers=8, ssm_dim=64, expand=2, conv_kernel=3, num_classes=2, tie_embeddings=True):
         super().__init__()
-        self.cls = nn.Parameter(torch.randn(1,1,d_model) * 0.02)
+        # Use larger initialization for CLS token
+        self.cls = nn.Parameter(torch.randn(1,1,d_model))
         self.embed = nn.Embedding(vocab_size, d_model)
         self.layers = nn.ModuleList([MambaBlock(d_model, ssm_dim, expand, conv_kernel) for _ in range(n_layers)])
         self.norm = RMSNorm(d_model)
         self.head = nn.Linear(d_model, num_classes, bias=True)
-        if tie_embeddings:
-            self.head.weight = self.embed.weight[:num_classes]  # lightweight tie (optional); comment out if you prefer untied
+        self.tie_embeddings = tie_embeddings
+        
+        # Initialize properly
+        self.apply(self._init_weights)
+        
+        # Tie embeddings AFTER initialization if needed
+        if self.tie_embeddings and num_classes <= vocab_size:
+            with torch.no_grad():
+                self.head.weight.copy_(self.embed.weight[:num_classes])
+        
+    def _init_weights(self, module):
+        if isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+        elif isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if module.bias is not None:
+                module.bias.data.zero_()
     def forward(self, input_ids, attention_mask=None):
         x = self.embed(input_ids)  # [B, L, D]
         B = x.size(0)
+        # Append CLS at the END so it can see the full sequence
         cls = self.cls.expand(B, -1, -1)
-        x = torch.cat([cls, x], dim=1)  # prepend CLS
+        x = torch.cat([x, cls], dim=1)  # append CLS
         for blk in self.layers:
-            x = x + blk(x)
+            residual = x
+            x = blk(x)
+            x = residual + x
         x = self.norm(x)
-        cls_h = x[:,0]  # take CLS
+        cls_h = x[:, -1]  # take CLS from end
         return self.head(cls_h)
