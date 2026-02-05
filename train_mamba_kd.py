@@ -1,246 +1,351 @@
-import math, torch, os
+import math
+import os
+import torch
 import torch.nn as nn
+from pathlib import Path
 from datasets import load_dataset
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from typing import Dict, Any, Tuple, Iterable
 from mamba_student import TinyMambaClassifier
 
-# ---------------- KD loss ----------------
-def kd_loss(student_logits, teacher_logits, y, T=2.0, alpha=0.7, label_smoothing=0.05):
-    # hard CE with smoothing
-    if label_smoothing > 0:
-        n = student_logits.size(-1)
+
+def kd_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    T: float = 2.0,
+    alpha: float = 0.7,
+    label_smoothing: float = 0.0,
+    use_margin=True,
+    conf_power: float = 1.0,  # 0=no weighting, 1=linear, 2=quadratic
+) -> tuple[torch.Tensor, dict[str, float]]:
+    # --- hard CE (optionally smoothed) ---
+    ce = nn.functional.cross_entropy(
+        student_logits, labels, label_smoothing=label_smoothing
+    )
+
+    # --- teacher soft targets ---
+    if use_margin and student_logits.size(-1) == 2:
+        # match margins: s_m = (s1-s0)/T, t_m = (t1-t0)/T
+        s_m = (student_logits[:, 1] - student_logits[:, 0]) / T
+        t_m = (teacher_logits[:, 1] - teacher_logits[:, 0]) / T
+        # confidence from teacher after temperature
         with torch.no_grad():
-            smoothed = torch.full_like(student_logits, fill_value=label_smoothing/(n-1))
-            smoothed.scatter_(1, y.view(-1,1), 1.0 - label_smoothing)
-        ce = torch.mean(torch.sum(-smoothed * torch.log_softmax(student_logits, dim=-1), dim=-1))
+            pt = torch.sigmoid(t_m)  # prob of class 1 from margin
+            w = (pt * (1 - pt)) * 4.0  # peaky near 0.5? invert if desired
+            if conf_power != 0:
+                w = (pt.clamp(1e-4, 1-1e-4) - 0.5).abs() * 2  # confidence 0..1
+                w = w.pow(conf_power).detach()
+        kl_or_mse = ((s_m - t_m) ** 2 * (w + 1e-6)).mean() * (T * T)
+        loss = (1 - alpha) * ce + alpha * kl_or_mse
+        parts = {"ce": ce.item(), "kl": kl_or_mse.item()}
+        return loss, parts
     else:
-        ce = nn.functional.cross_entropy(student_logits, y)
+        log_p_s = nn.functional.log_softmax(student_logits / T, dim=-1)
+        p_t = nn.functional.softmax(teacher_logits / T, dim=-1)
+        kl = nn.functional.kl_div(log_p_s, p_t, reduction="batchmean") * (T * T)
+        loss = (1 - alpha) * ce + alpha * kl
+        return loss, {"ce": ce.item(), "kl": kl.item()}
 
-    # soft KL (teacher -> student)
-    log_p_s = nn.functional.log_softmax(student_logits / T, dim=-1)
-    p_t = nn.functional.softmax(teacher_logits / T, dim=-1)
-    kl = nn.functional.kl_div(log_p_s, p_t, reduction="batchmean") * (T * T)
 
-    # weight them
-    return (1 - alpha) * ce + alpha * kl, {"ce": ce.item(), "kl": kl.item()}
+def make_tokenized(
+    split: str,
+    tokenizer: AutoTokenizer,
+    *,
+    max_len: int = 128,
+    batch_size: int = 128,
+    shuffle: bool = False,
+) -> Tuple[Any, DataLoader]:
+    """Tokenise the SST‑2 split and build a dataloader.
 
-def make_tokenized(split, tok, max_len=128, bs=128, shuffle=False):
+    An ``idx`` column is added if missing and preserved through the
+    mapping so that teacher logits can be looked up by index.
+    """
     ds = load_dataset("glue", "sst2")[split]
-    # Add index column to track original positions
+    # ensure an idx column exists
     if "idx" not in ds.column_names:
         ds = ds.add_column("idx", list(range(len(ds))))
-    def _tok(batch): 
-        enc = tok(batch["sentence"], truncation=True, padding="max_length", max_length=max_len)
-        # Preserve idx
+
+    def _tok(batch: Dict[str, Iterable]) -> Dict[str, Any]:
+        enc = tokenizer(
+            batch["sentence"], truncation=True, padding="max_length",
+            max_length=max_len
+        )
         enc["idx"] = batch["idx"]
         return enc
-    # map preserves idx if we add it to the tokenized columns
+
     ds = ds.map(_tok, batched=True)
-    ds.set_format(type="torch", columns=["input_ids","attention_mask","label","idx"])
-    return ds, DataLoader(ds, batch_size=bs, shuffle=shuffle, drop_last=False, num_workers=0)
+    ds.set_format(
+        type="torch",
+        columns=["input_ids", "attention_mask", "label", "idx"],
+    )
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=False,
+        num_workers=0,
+    )
+    return ds, loader
 
-# # --------------- data --------------------
-# def make_tokenized(split, tok, max_len=128, bs=128, shuffle=False):
-#     ds = load_dataset("glue", "sst2")[split]
-#     def _tok(batch): return tok(batch["sentence"], truncation=True, padding="max_length", max_length=max_len)
-#     ds = ds.map(_tok, batched=True)
-#     ds.set_format(type="torch", columns=["input_ids","attention_mask","label"])
-#     return ds, DataLoader(ds, batch_size=bs, shuffle=shuffle, drop_last=False, num_workers=2)
 
-# --------------- training ----------------
-def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def evaluate(
+    model: nn.Module,
+    val_loader: Iterable,
+    device: torch.device,
+    ema_shadow: Dict[str, torch.Tensor],
+) -> float:
+    """Evaluate a model using its EMA weights on the validation set."""
+    # store original weights
+    original_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    # load EMA weights
+    model.load_state_dict(ema_shadow, strict=False)
+    model.eval()
+    correct = total = 0
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["label"].to(device)
+            logits = model(input_ids, attention_mask)
+            preds = logits.argmax(-1)
+            correct += (preds == labels).sum().item()
+            total += labels.numel()
+    # restore original weights
+    model.load_state_dict(original_state, strict=False)
+    return correct / max(1, total)
+
+
+def main() -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    print("Starting training...")
-    
+    print("Starting training…")
+
+    # hyperparameters
     max_len = 128
     epochs = 14
     lr = 2e-4
-    wd = 0.05
+    weight_decay = 0.01
     warmup_ratio = 0.06
-    alpha = 0.7
-    T = 2.0
-    label_smoothing = 0.05
+    alpha = 0.9
+    T = 4.0
+    label_smoothing = 0.00
     seed = 42
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
     # teacher assets
-    TEACHER_ID = "bert-base-uncased"  # tokenizer only; logits are loaded from file
-    TEACHER_LOGITS = "teacher_sst2_logits.pt"  # produced by dump_teacher.py
-    teacher_pack = torch.load(TEACHER_LOGITS)
-    
-    train_logits = torch.as_tensor(teacher_pack["train"]["logits"])      # [N_train, 2]
-    train_labels = torch.as_tensor(teacher_pack["train"]["labels"])      # [N_train]
-    val_logits   = torch.as_tensor(teacher_pack["validation"]["logits"]) # [N_val, 2]
-    val_labels   = torch.as_tensor(teacher_pack["validation"]["labels"]) # [N_val]
+    # use the same id as in dump_teacher.py to ensure consistent tokenisation
+    teacher_model_id = "textattack/bert-base-uncased-SST-2"
+    logits_path = Path(__file__).resolve().parent / "teacher_sst2_logits.pt"
+    teacher_pack = torch.load(str(logits_path), map_location="cpu")
+    train_logits = teacher_pack["train"]["logits"].float()
+    train_labels = teacher_pack["train"]["labels"].long()
+    val_logits = teacher_pack["validation"]["logits"].float()
+    val_labels = teacher_pack["validation"]["labels"].long()
 
+    # tokeniser
+    tokenizer = AutoTokenizer.from_pretrained(teacher_model_id, use_fast=True)
+    vocab_size = tokenizer.vocab_size
 
-    tok = AutoTokenizer.from_pretrained(TEACHER_ID, use_fast=True)
-    vocab_size = tok.vocab_size
-
-    # data
-    train_ds, train_loader = make_tokenized("train", tok, max_len=max_len, bs=128, shuffle=True)
-    val_ds,   val_loader   = make_tokenized("validation", tok, max_len=max_len, bs=256, shuffle=False)
+    # datasets and loaders
+    train_ds, train_loader = make_tokenized(
+        "train", tokenizer, max_len=max_len, batch_size=128, shuffle=True
+    )
+    val_ds, val_loader = make_tokenized(
+        "validation", tokenizer, max_len=max_len, batch_size=256, shuffle=False
+    )
 
     # model
     model = TinyMambaClassifier(
-        vocab_size=vocab_size, d_model=192, n_layers=8, ssm_dim=64, expand=2, conv_kernel=3, num_classes=2, tie_embeddings=False
+        vocab_size=vocab_size,
+        d_model=192,
+        n_layers=8,
+        ssm_dim=64,
+        expand=2,
+        conv_kernel=3,
+        num_classes=2,
+        tie_embeddings=False,
     ).to(device)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
     print(f"Train dataset size: {len(train_ds)}, batches: {len(train_loader)}")
     print(f"Val dataset size: {len(val_ds)}, batches: {len(val_loader)}")
-    print(f"Teacher logits shapes: train={train_logits.shape}, val={val_logits.shape}")
+    print(
+        f"Teacher logits shapes: train={train_logits.shape}, val={val_logits.shape}"
+    )
 
-    # EMA (simple)
+    # --- set up / resume EMA ---
     ema_decay = 0.999
-    ema_shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
-
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd, betas=(0.9, 0.98))
+    ckpt_path = Path(__file__).resolve().parent / "ckpts" / "best_ema.pt"
+    
+    # Initialize optimizer and scheduler first (needed for resume)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.98)
+    )
     total_steps = math.ceil(len(train_loader) * epochs)
     warmup_steps = int(total_steps * warmup_ratio)
-    sched = get_cosine_schedule_with_warmup(opt, warmup_steps, total_steps)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, warmup_steps, total_steps
+    )
 
-    best_val = 0.0
-    os.makedirs("ckpts", exist_ok=True)
+    checkpoint = None
+    if ckpt_path.exists():
+        print(f"[Resume] Loading EMA checkpoint from {ckpt_path}")
+        checkpoint = torch.load(str(ckpt_path), map_location=device)
+        ema_state = checkpoint["model"]  # this is an EMA state_dict
+        # Load EMA weights into the live model
+        model.load_state_dict(ema_state, strict=False)
+        # Recreate EMA shadow from the loaded model params
+        ema_shadow: Dict[str, torch.Tensor] = {
+            k: v.detach().clone() for k, v in model.state_dict().items()
+        }
+        best_val = float(checkpoint.get("acc", 0.0))
+        print(f"[Resume] Resumed from best EMA (val acc={best_val:.4f})")
+        
+        # Load optimizer/scheduler state if available (for true resume)
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            print("[Resume] Loaded optimizer state")
+        if "scheduler" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler"])
+            print("[Resume] Loaded scheduler state")
+        if "epoch" in checkpoint:
+            start_epoch = int(checkpoint["epoch"]) + 1
+            print(f"[Resume] Will continue from epoch {start_epoch}")
+        else:
+            start_epoch = 1
+    else:
+        # Fresh EMA from randomly initialized model
+        ema_shadow: Dict[str, torch.Tensor] = {
+            k: v.detach().clone() for k, v in model.state_dict().items()
+        }
+        best_val = 0.0
+        start_epoch = 1
 
-    # Initial validation (before EMA)
-    print("\n=== Initial Evaluation ===")
+    os.makedirs(Path(__file__).resolve().parent / "ckpts", exist_ok=True)
+
+    # initial evaluation before any training
     model.eval()
-    correct, total = 0, 0
-    sample_logits = []
-    for i, batch in enumerate(val_loader):
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        y = batch["label"].to(device)
-        logits = model(input_ids, attention_mask)
-        if i == 0:
-            sample_logits = logits[:5]
-        pred = logits.argmax(-1)
-        correct += (pred == y).sum().item()
-        total += y.numel()
-    init_acc = correct / max(1, total)
-    print(f"Initial val accuracy: {init_acc:.4f}")
-    print(f"Sample logits (first 5): {sample_logits}")
-    print(f"Sample predictions: {sample_logits.argmax(-1).tolist()}\n")
-
-    step_idx = 0
-    for ep in range(1, epochs+1):
-        model.train()
-        pbar = tqdm(train_loader, desc=f"Epoch {ep}/{epochs}")
-        for i, batch in enumerate(pbar):
+    correct = total = 0
+    sample_logits: torch.Tensor | None = None
+    with torch.no_grad():
+        for i, batch in enumerate(val_loader):
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
-            y = batch["label"].to(device)
-            
-            # Get teacher logits using the original dataset indices
-            idx = batch["idx"].to(torch.long).cpu()  # Get indices from batch
+            labels = batch["label"].to(device)
+            logits = model(input_ids, attention_mask)
+            if sample_logits is None:
+                sample_logits = logits[:5]
+            preds = logits.argmax(-1)
+            correct += (preds == labels).sum().item()
+            total += labels.numel()
+    init_acc = correct / max(1, total)
+    print(f"Initial val accuracy: {init_acc:.4f}")
+    if sample_logits is not None:
+        print(f"Sample logits (first 5): {sample_logits}")
+        print(
+            f"Sample predictions: {sample_logits.argmax(-1).tolist()}"
+        )
+
+    # Calculate starting step if resuming (checkpoint already loaded above if exists)
+    step_idx = 0
+    if checkpoint is not None and "step" in checkpoint:
+        step_idx = int(checkpoint["step"])
+        print(f"[Resume] Resuming from step {step_idx}")
+    
+    for epoch in range(start_epoch, epochs + 1):
+        model.train()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
+        for batch_idx, batch in enumerate(pbar):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels_batch = batch["label"].to(device)
+            idx = batch["idx"].long()  # already on CPU
             t_logits = train_logits[idx].to(device)
 
+            # forward
             s_logits = model(input_ids, attention_mask)
-            
-            # Debug: check shapes and values on first batch
-            if i == 0 and ep == 1:
-                print(f"\nDebug first batch:")
-                print(f"  idx range: {idx.min().item()} to {idx.max().item()}")
-                print(f"  y shape: {y.shape}, sample labels: {y[:5].tolist()}")
-                print(f"  t_logits shape: {t_logits.shape}, sample values: {t_logits[0]}")
-                print(f"  s_logits shape: {s_logits.shape}, sample values: {s_logits[0]}")
 
-            loss, parts = kd_loss(s_logits, t_logits, y, T=T, alpha=alpha, label_smoothing=label_smoothing)
-            
-            if i == 0 and ep == 1:
-                print(f"  Loss: {loss.item():.4f}, CE: {parts['ce']:.4f}, KL: {parts['kl']:.4f}\n")
-                
-            opt.zero_grad(set_to_none=True)
+            # before computing loss
+            progress = step_idx / total_steps
+            alpha_now = 0.5 + 0.4 * (1 - progress)  # 0.9 -> 0.5 over training
+            T_now = 2.0 + (4.0 - 2.0) * (1 - progress)        # 4 -> 2
+            loss, parts = kd_loss(
+                s_logits, t_logits, labels_batch,
+                T=T_now, alpha=alpha_now, label_smoothing=0.0,
+                use_margin=True, conf_power=1.0
+            )
+
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            
-            # Check gradient norms
-            if i == 0 and ep == 1:
-                total_norm = 0
-                for p in model.parameters():
-                    if p.grad is not None:
-                        param_norm = p.grad.data.norm(2)
-                        total_norm += param_norm.item() ** 2
-                total_norm = total_norm ** 0.5
-                print(f"  Grad norm: {total_norm:.6f}\n")
-            
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            sched.step()
+            optimizer.step()
+            scheduler.step()
 
             # EMA update
             with torch.no_grad():
-                # Update EMA weights
                 current_state = model.state_dict()
                 for k in ema_shadow.keys():
                     if k in current_state and current_state[k].dtype.is_floating_point:
-                        ema_shadow[k].mul_(ema_decay).add_(current_state[k].detach(), alpha=1-ema_decay)
+                        ema_shadow[k].mul_(ema_decay).add_(
+                            current_state[k].detach(), alpha=1 - ema_decay
+                        )
 
+            # update progress bar
             pbar.set_postfix(loss=float(loss.item()), ce=parts["ce"], kl=parts["kl"])
-            
-            # Track loss trajectory
-            if ep == 1 and step_idx in [0, 50, 100, 200]:
-                print(f"\nStep {step_idx}: Loss={loss.item():.4f}, avg s_logits_diff={torch.abs(s_logits[:, 0] - s_logits[:, 1]).mean().item():.4f}")
-            
+
+            # optional debug printing
+            if epoch == 1 and step_idx in {0, 50, 100, 200}:
+                avg_diff = torch.abs(s_logits[:, 0] - s_logits[:, 1]).mean().item()
+                print(
+                    f"\nStep {step_idx}: Loss={loss.item():.4f}, avg s_logits_diff={avg_diff:.4f}"
+                )
+
             step_idx += 1
 
-        # --------- Eval (current weights for debugging) ----------
+        # evaluate current weights
         model.eval()
-        correct, total = 0, 0
-        for batch in val_loader:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            y = batch["label"].to(device)
-            logits = model(input_ids, attention_mask)
-            pred = logits.argmax(-1)
-            correct += (pred == y).sum().item()
-            total += y.numel()
+        correct = total = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels_eval = batch["label"].to(device)
+                logits = model(input_ids, attention_mask)
+                preds = logits.argmax(-1)
+                correct += (preds == labels_eval).sum().item()
+                total += labels_eval.numel()
         eval_acc = correct / max(1, total)
-        
-        print(f"[Val] acc={eval_acc:.4f}")
-        if eval_acc > best_val:
-            best_val = eval_acc
-            torch.save({"model": ema_shadow, "acc": best_val}, f"ckpts/best_ema.pt")
-            print("Saved ckpts/best_ema.pt")
 
-    print(f"Best val acc: {best_val:.4f}")
+        # evaluate EMA weights
+        ema_acc = evaluate(model, val_loader, device, ema_shadow)
+        print(
+            f"[Val] current acc={eval_acc:.4f}, EMA acc={ema_acc:.4f}"
+        )
 
-@torch.no_grad()
-def evaluate(model, val_loader, device, ema_shadow):
-    # swap in EMA weights
-    original = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    model.load_state_dict(ema_shadow, strict=False)
+        if ema_acc > best_val:
+            best_val = ema_acc
+            # persist EMA state dict with optimizer/scheduler for resume
+            torch.save(
+                {
+                    "model": ema_shadow,
+                    "acc": best_val,
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "epoch": epoch,
+                    "step": step_idx,
+                },
+                Path(__file__).resolve().parent / "ckpts" / "best_ema.pt",
+            )
+            print("Saved new best EMA checkpoint")
 
-    model.eval()
-    correct, total = 0, 0
-    
-    # Debug: check if EMA weights are different from original
-    if total == 0:  # First call
-        diff = sum((ema_shadow[k] - original[k]).abs().sum() for k in ema_shadow.keys())
-        print(f"EMA vs original weight diff: {diff.item():.6f}")
-    
-    for i, batch in enumerate(val_loader):
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        y = batch["label"].to(device)
-        logits = model(input_ids, attention_mask)
-        
-        # Debug: check if outputs vary
-        if i == 0 and total == 0:
-            print(f"First batch logits sample: {logits[:3]}")
-        
-        pred = logits.argmax(-1)
-        correct += (pred == y).sum().item()
-        total += y.numel()
+    print(f"Best EMA val acc: {best_val:.4f}")
 
-    # restore original weights
-    model.load_state_dict(original, strict=False)
-    return correct / max(1, total)
 
 if __name__ == "__main__":
     main()
