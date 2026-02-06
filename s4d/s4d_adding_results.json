@@ -1,0 +1,23 @@
+{
+  "batch_size": 32,
+  "ckpt": "s4d_adding_best.pt",
+  "d_model": 64,
+  "d_state": 64,
+  "dropout": 0.0,
+  "mode": "eval_only",
+  "seed": 42,
+  "seq_len": 1000,
+  "split_seeds": {
+    "test": 44,
+    "train": 42,
+    "val": 43
+  },
+  "test_acc": 1.0,
+  "test_mse": 8.269941614707932e-05,
+  "test_samples": 1000,
+  "timestamp": "2026-02-06T03:51:26.061474+00:00",
+  "tolerance": 0.04,
+  "train_samples": 10000,
+  "uses_training_data_for_test": false,
+  "val_samples": 1000
+}
