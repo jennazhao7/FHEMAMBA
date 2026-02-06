@@ -49,14 +49,30 @@ An earlier minimal variant dropped D, dropout, and output_linear for FHE/minimal
 
 ---
 
-## 4. Dependencies
+## 4. Key differences (kernel, convolution, head/pooling)
+
+**Kernel (S4DKernel):**
+- **Official:** uses `N//2` conjugate pairs and `2 * ... .real` in the Vandermonde/exp formulation.
+- **Mini:** uses full `d_state` and returns `.real` directly; equivalent ZOH kernel, but parameterized without conjugate pairing.
+
+**Convolution:**
+- **Official:** FFT‑based convolution (`rfft/irfft`) for speed at long lengths.
+- **Mini:** direct causal `conv1d` (simpler, slower at long lengths).
+
+**Head / pooling:**
+- **Official:** no built‑in head; pooling + classifier live in the outer model.
+- **Mini:** mean‑pool over time with a built‑in `Linear(d_model→1)` head for the demo.
+
+---
+
+## 5. Dependencies
 
 - **Official:** `einops`, `src.models.nn.DropoutNd`.
 - **Mini:** only `torch`, `numpy`. Self-contained.
 
 ---
 
-## 5. Conclusion
+## 6. Conclusion
 
 - **Kernel:** Faithful (same diagonal SSM, ZOH, kernel recurrence).
 - **Convolution:** Faithful (causal; FFT vs conv1d).

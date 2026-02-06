@@ -28,6 +28,20 @@ This runs a forward pass and a few dummy training steps. **You do not need a GPU
 - **`train_mini_s4d.py`** — `S4DKernel` (ZOH kernel) + `MiniS4D` (full block + regression decoder).
 - **`VERIFICATION_vs_official_s4d.md`** — Line-by-line verification against official S4D.
 
+## Mini vs Original (structure & sizes)
+
+**MiniS4D in this repo (`train_mini_s4d.py`):**
+
+- **Blocks:** 1 S4D block (no stacking).
+- **Default sizes:** `d_model=4`, `d_state=8`, `L=64`, `dropout=0.0`.
+- **Block internals:** ZOH S4D kernel → causal `conv1d` → D skip → GELU + dropout → `Conv1d + GLU` → mean pool → `Linear(d_model→1)` head.
+
+**Original S4D (`state-spaces/s4` `models/s4/s4d.py`):**
+
+- **Blocks:** 1 S4D block class intended to be stacked (e.g., 4–6 layers in practice).
+- **Typical sizes:** `d_model` usually 128–512, `d_state` usually 64 (depends on experiment).
+- **Block internals:** ZOH S4D kernel → FFT convolution → D skip → GELU + dropout → `Conv1d + GLU`. No built‑in head (pooling + classifier are done by the outer model).
+
 ## Usage (in code)
 
 ```python
